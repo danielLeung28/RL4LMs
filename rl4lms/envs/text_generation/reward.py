@@ -15,8 +15,10 @@ from rl4lms.envs.text_generation.metric import (
     TERMetric,
     chrFmetric,
     IntentAccuracyDailyDialog,
+    SQLiAvoidanceMetric
 )
 import numpy as np
+
 from typing import List, Dict, Any
 
 
@@ -63,6 +65,138 @@ class BatchedRewardFunction(ABC):
         An abstract class for batched reward functions for text generation
         """
         raise NotImplementedError
+
+
+class SQLiDetectionAvodianceFunction(RewardFunction):
+    def reward_func(self, gen_text: str, org_query: str):
+        validity, is_sqli, evaded, similarity, is_valid_sqli, evaded_if_valid_sqli, evaded_overall = SQLiAvoidanceMetric.calc_metric_single(gen_text, org_query)
+
+        if(evaded_overall == 1):
+            reward = 5000
+        else:
+            reward = 1
+
+        if(similarity > 0.5):
+            reward *= (1.5-similarity) ** self.similarity_weight
+        else:
+            reward *= ((0.5 + self.low_similarity_reward * 0.5) + (similarity * (1- self.low_similarity_reward)) ** self.similarity_weight)
+
+        return reward
+
+    def __init__(self, *args) -> None:
+        self.similarity_weight = 5
+        self.min_penalty = 0.5 ** self.similarity_weight
+        self.low_similarity_reward = 0.2
+        super().__init__()
+
+
+    def __call__(
+        self,
+        current_observation: Observation,
+        action: int,
+        next_observation: Observation,
+        done: bool,
+        meta_info: Dict[str, Any] = None,
+    ) -> float:
+        if done:
+            return self.reward_func(''.join(current_observation.action_history), current_observation.target_or_reference_texts[0])
+        return 0
+
+
+class SQLiDetectionAvodianceFunctionIterative(RewardFunction):
+    reward = {'is_valid_sqli' : 200, 'sqli_evaded' : 10,
+              'valid_evaded': 5, 'validity': 2, 'is_sqli': 1, 'evaded': 0.5}
+    metric_list = ['validity', 'is_sqli', 'evaded', 'similarity', 'is_valid_sqli', 'evaded_if_valid_sqli', 'evaded_overall']
+    high_similarity_weight = 15
+    low_similarity_weight = 5
+    high_similarity_cutoff = 0.9
+    high_similarity_bonus = 0.75
+
+    low_similarity_reward = 0.2
+    punishment_factor = 2.5
+    max_penalty = 0
+    for metric, metric_reward in reward.items():
+        max_penalty += metric_reward * punishment_factor
+
+    test_counter = 0
+
+    @classmethod
+    def reward_func(cls, gen_text: str, org_query: str, org_metric_info: dict, url: str = None):
+        # validity.append(reward_test[0])
+        #     is_sqli.append(reward_test[1])
+        #     evaded.append(reward_test[2])
+        #     similarity.append(reward_test[3])
+        #     is_valid_sqli.append(reward_test[4])
+        #     evaded_if_valid_sqli.append(reward_test[5])
+        #     evaded_overall.append(reward_test[6])
+        metrics = dict(zip(cls.metric_list, SQLiAvoidanceMetric.calc_metric_single(gen_text, org_query, url)))
+        metrics['sqli_evaded'] = 1 if metrics['is_sqli'] == 1 and metrics['evaded'] == 1 else 0
+        metrics['valid_evaded'] = 1 if metrics['validity'] == 1 and metrics['evaded'] == 1 else 0
+
+        # meta_data = {'validity': item['validity'], 'is_sql_injection': item['is_sql_injection'],
+        #             'evaded_detection': item['evaded_detection']})
+        org_metric_info['valid_evaded'] = 1 if org_metric_info['validity'] == 1 and org_metric_info['evaded'] == 1 else 0
+        org_metric_info['sqli_evaded'] = 1 if org_metric_info['is_sqli'] == 1 and org_metric_info['evaded'] == 1 else 0
+        org_metric_info['is_valid_sqli'] = 1 if org_metric_info['is_sqli'] == 1 and org_metric_info['validity'] == 1 else 0
+        org_metric_info['evaded_overall'] = 1 if org_metric_info['is_sqli'] == 1 and org_metric_info['validity'] == 1 and org_metric_info['evaded'] == 1 else 0
+        
+        reward = cls.max_penalty
+
+        if(metrics['evaded_overall'] == 1):
+            reward += 500
+        else:
+            for metric, metric_reward in cls.reward.items():
+                if(org_metric_info[metric] ^ metrics[metric]):
+                    if(org_metric_info[metric] == 1 and metrics[metric] == 0):
+                        reward -= metric_reward * cls.punishment_factor
+                    else:
+                        reward += metric_reward
+        
+        before_sim_reward = reward
+
+        if(org_metric_info['evaded_overall'] == 1):
+
+            if(metrics['similarity'] > cls.high_similarity_cutoff):
+                reward *= ((1 - ((metrics['similarity'] - cls.high_similarity_cutoff) / (1- cls.high_similarity_cutoff)) * (1-cls.high_similarity_bonus)) ** cls.high_similarity_weight)
+            else:
+                reward *= ((metrics['similarity'] * (1- cls.low_similarity_reward) / (cls.high_similarity_cutoff * (1-cls.low_similarity_reward))) ** cls.low_similarity_weight)
+
+        else:
+
+            if(metrics['similarity'] > 0.5):
+                reward *= (1.5-metrics['similarity']) ** cls.low_similarity_weight
+            else:
+                reward *= ((0.5 + cls.low_similarity_reward * 0.5) + (metrics['similarity'] * (1- cls.low_similarity_reward)) ** cls.low_similarity_weight)
+
+
+
+        if(reward > 5000 + cls.max_penalty or reward < 0):
+            print(gen_text)
+            print(org_query)
+            print(org_metric_info)
+            print(metrics)
+            print(before_sim_reward)
+            print(reward)
+            exit()
+
+        return reward
+
+    def __init__(self, url: str = None) -> None:
+        super().__init__()
+        self.url = url
+
+
+    def __call__(
+        self,
+        current_observation: Observation,
+        action: int,
+        next_observation: Observation,
+        done: bool,
+        meta_info: Dict[str, Any] = None,
+    ) -> float:
+        if done:
+            return SQLiDetectionAvodianceFunctionIterative.reward_func(''.join(current_observation.action_history), current_observation.target_or_reference_texts[0], meta_info, self.url)
+        return 0
 
 
 ### Automated reward functions ###########################

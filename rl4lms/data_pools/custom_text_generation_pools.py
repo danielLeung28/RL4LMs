@@ -1,16 +1,140 @@
 from rl4lms.data_pools.text_generation_pool import TextGenPool, Sample
 from rl4lms.data_pools.task_utils.totto import preprocess_utils
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from tqdm import tqdm
 from nltk.tokenize import word_tokenize
 import os
 from urllib.request import urlretrieve
 from pathlib import Path
-import pandas
+import pandas as pd
 from collections import defaultdict
 import zipfile
 import json
 
+
+class SQLiDataPool(TextGenPool):
+    @classmethod
+    def prepare(cls, split: str):
+        #dataset = load_dataset('csv', data_files='dataset/Modified_SQL_Dataset.csv')
+        #dataset = load_dataset('csv', data_files='dataset/SQL_injection_only_dataset.csv')
+        dataset = load_dataset('csv', data_files='dataset/first_dataset.csv')
+
+        #dataset = load_dataset('csv', data_files='Modified_SQL_Dataset_with_metrics.csv')
+        #dataset = dataset[(dataset['validity'] == 1) & (dataset['is_sql_injection'] == 1)].reset_index(drop=True)
+        dataset_train = dataset['train'].train_test_split(test_size=0.2, seed=0)
+        #dataset_train = dataset_train['test'].train_test_split(test_size=0.1, seed=0) #test
+        dataset_valid = dataset_train['test'].train_test_split(test_size=0.5, seed=0)
+        dataset = DatasetDict({
+            'train': dataset_train['train'],
+            'val': dataset_valid['train'],
+            'test': dataset_valid['test']
+        })
+        #prompt_template = '<schema></schema><question>modify this query to evade SQL injection detection: {0}</question><sql>' #for general use
+        #prompt_template = 'Query: {0} \n for: change this query to evade SQL injection detection' #for cssupport/t5-small-awesome-text-to-sql
+        prompt_template = 'Query: {0} \n for: modify this query to evade SQL injection detection, when you are done, terminate the generated query' #for cssupport/t5-small-awesome-text-to-sql
+
+        #prompt_template = '[question]modify this query to evade SQL injection detection: {0}[/question][sql]'
+        samples = []
+        for ix, item in enumerate(dataset[split]):
+            sample = Sample(id=f"{split}_{ix}",
+                            prompt_or_input_text=prompt_template.format(item["payload"]),
+                            references=[str(item["payload"])])
+                            #references=[str(item["Label"])])
+            samples.append(sample)
+        pool_instance = cls(samples)
+        return pool_instance
+
+class SQLiDataPoolIterative(TextGenPool):
+    @classmethod
+    def prepare(cls, split: str,
+                dataset: str = 'dataset/first_dataset_with_metrics.csv',
+                metric_as_evasion: str = 'cnn_evaded_detection'):
+        dataset_base = load_dataset('csv', data_files = dataset)
+        dataset_train = dataset_base['train'].train_test_split(test_size=0.1, seed=0)
+
+        #dataset_train = dataset_train['test'].train_test_split(test_size=0.1, seed=0) #test
+        #dataset_valid = dataset_train['test'].train_test_split(test_size=0.5, seed=0)
+        dataset_base = DatasetDict({
+            'train': dataset_train['train'],
+            'val': dataset_train['test'],
+            'test': dataset_train['test']
+        })
+        #prompt_template = '<schema></schema><question>modify this query to evade SQL injection detection: {0}</question><sql>' #for general use
+        #prompt_template = 'Query: {0} \n for: change this query to evade SQL injection detection' #for cssupport/t5-small-awesome-text-to-sql
+        #prompt_template = 'Query: {0} \n for: modify this query to evade SQL injection detection' #for cssupport/t5-small-awesome-text-to-sql
+
+        #prompt_template = '[question]modify this query to evade SQL injection detection: {0}[/question][sql]'
+        samples = []
+        for ix, item in enumerate(dataset_base[split]):
+            #generated_query,validity,is_sql_injection,evaded_detection
+            if(item['validity'] == 1 and item['is_sqli'] == 1 and item[metric_as_evasion] == 1):
+                prompt_template = 'Query: {0} \n for: This query can evade SQL injection detection, generate a SQL injection query that can evade detection based on the given query, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This query can evade SQL injection detection, gcreate more SQL injection query that can evade detection, while maintaining the same meaning as the given query, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This is an SQL injection query, it can avoid SQL injection detection, generate another SQL injection query by modifying this query, the new query should have the same meaning and can avoid detection, when you are done, terminate the generated query'
+            elif(item['validity'] == 1 and item['is_sqli'] == 1):
+                prompt_template = 'Query: {0} \n for: This is an SQL injection query, modify the query to evade SQL injection detection, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This is an SQL injection query, modify the query to evade SQL injection detection, it should be a SQL injection query that has the same meaning as the given query, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This is an SQL injection query, modify the query to evade SQL injection detection, it should be a SQL injection query that has the same meaning as the given query, when you are done, terminate the generated query'
+            elif(item['validity'] == 1):
+                prompt_template = 'Query: {0} \n for: This is an SQL query, modify it to be an SQL injection query that can evade detection, when you are done, terminate the generated query'
+            else:
+                prompt_template = 'Query: {0} \n for: This is an invalid SQL query, modify it so that it becomes a valid SQL injection query, when you are done, terminate the generated query'
+
+            sample = Sample(id=f"{split}_{ix}",
+                            prompt_or_input_text=prompt_template.format(item["generated_query"]),
+                            references=[str(item["generated_query"])],
+                            meta_data = {'validity': item['validity'], 'is_sqli': item['is_sqli'],
+                                        'evaded': item[metric_as_evasion]})
+                            
+                            #references=[str(item["Label"])])
+            samples.append(sample)
+        pool_instance = cls(samples)
+        return pool_instance
+
+class SQLiDataPoolCrossVal(TextGenPool):
+
+
+    @classmethod
+    def prepare(cls, split: str,
+                train_dataset_path: str = 'dataset/training_dataset.csv',
+                val_dataset_path: str = 'dataset/validation_dataset.csv',
+                metric_as_evasion: str = 'cnn_evaded_detection'):
+        
+        dataset_train = pd.read_csv(train_dataset_path).to_dict('records')
+        dataset_valid = pd.read_csv(val_dataset_path).to_dict('records')
+
+        dataset_base = DatasetDict({
+            'train': dataset_train,
+            'val': dataset_valid,
+            'test': dataset_valid
+        })
+        
+        samples = []
+        for ix, item in enumerate(dataset_base[split]):
+            #generated_query,validity,is_sql_injection,evaded_detection
+            if(item['validity'] == 1 and item['is_sqli'] == 1 and item[metric_as_evasion] == 1):
+                prompt_template = 'Query: {0} \n for: This query can evade SQL injection detection, generate a SQL injection query that can evade detection based on the given query, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This query can evade SQL injection detection, gcreate more SQL injection query that can evade detection, while maintaining the same meaning as the given query, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This is an SQL injection query, it can avoid SQL injection detection, generate another SQL injection query by modifying this query, the new query should have the same meaning and can avoid detection, when you are done, terminate the generated query'
+            elif(item['validity'] == 1 and item['is_sqli'] == 1):
+                prompt_template = 'Query: {0} \n for: This is an SQL injection query, modify the query to evade SQL injection detection, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This is an SQL injection query, modify the query to evade SQL injection detection, it should be a SQL injection query that has the same meaning as the given query, when you are done, terminate the generated query'
+                #prompt_template = 'Query: {0} \n for: This is an SQL injection query, modify the query to evade SQL injection detection, it should be a SQL injection query that has the same meaning as the given query, when you are done, terminate the generated query'
+            elif(item['validity'] == 1):
+                prompt_template = 'Query: {0} \n for: This is an SQL query, modify it to be an SQL injection query that can evade detection, when you are done, terminate the generated query'
+            else:
+                prompt_template = 'Query: {0} \n for: This is an invalid SQL query, modify it so that it becomes a valid SQL injection query, when you are done, terminate the generated query'
+
+            sample = Sample(id=f"{split}_{ix}",
+                            prompt_or_input_text=prompt_template.format(item["generated_query"]),
+                            references=[str(item["generated_query"])],
+                            meta_data = {'validity': item['validity'], 'is_sqli': item['is_sqli'],
+                                        'evaded': item[metric_as_evasion]})
+                            
+                            #references=[str(item["Label"])])
+            samples.append(sample)
+        pool_instance = cls(samples)
+        return pool_instance
 
 class ToTTo(TextGenPool):
     @classmethod

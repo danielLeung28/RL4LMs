@@ -17,6 +17,20 @@ from tqdm import tqdm
 import copy
 import rouge
 
+import sys, os, random, time
+import jellyfish
+
+pwd = os.getcwd()
+sys.path.append(pwd)
+sys.path.append(pwd + '/detector_model/cnn')
+sys.path.append(pwd + '/detector_model/lstm')
+
+from sql_validator import checkSQLValidity
+from detector_model.nlp_classical_2_stages_detection.nlp_classical_detector import classical_nlp_2_stages
+from detector_model.cnn.detector import CNNDetector
+from detector_model.lstm.detector import LSTMDetector
+from detector_model.waf_detector.detector import WAFDetector
+
 
 class BaseMetric:
     @abstractmethod
@@ -39,6 +53,161 @@ class BaseMetric:
 
         """
         raise NotImplementedError
+
+
+class SQLiAvoidanceMetric(BaseMetric):
+    sql_validator = checkSQLValidity()
+    eval_model = classical_nlp_2_stages()
+    batch_size = 16
+    device = torch.device("cpu")
+    CNNDetector.device = device
+    avg_time = [0.0, 0.0, 0.0]
+    url = None
+
+    # LSTMDetector.device = device
+
+    # detector_model = [lambda x: CNNDetector.predict([x]), 
+    #                 lambda x: LSTMDetector.predict([x]), lambda x: SQLiAvoidanceMetric.eval_model.classical_detector([x])]
+
+    # #randomly uses different detection model for each evaluation, reduce overfitting to just one model
+    # @classmethod
+    # def get_detection(cls, gen_text: str):
+    #     return CNNDetector.predict([gen_text])
+    #     # return cls.detector_model[random.randrange(0, len(cls.detector_model))](gen_text)
+    #     # return cls.detector_model[random.randrange(0, len(cls.detector_model))](gen_text)
+
+    @classmethod
+    def get_waf_detection(cls, gen_text_list: list[str], url: str):
+        detection_result = []
+
+        for i in range(0, len(gen_text_list), cls.batch_size):
+            detection_result += WAFDetector.predict(url, gen_text_list[i:i+cls.batch_size])
+        return detection_result
+
+    @classmethod
+    def get_detection(cls, gen_text_list: list[str], validity_for_queries: list[int], is_sqli_for_queries: list[int], url: str = None):
+
+        detection_required = []
+        detection_required_index = []
+        detection_result = [1 for i in range(len(gen_text_list))]
+
+        #skipping detection for generated text if the generated text is not valid sqli, this is to decrease training time
+        for i in range(len(gen_text_list)): 
+            if(validity_for_queries[i] == 1 and is_sqli_for_queries[i] == 1):
+                detection_required.append(gen_text_list[i])
+                detection_required_index.append(i)
+
+        if(len(detection_required_index) > 1):
+            if(url is not None):
+                print(len(detection_required_index))
+                temp_detection_result = cls.get_waf_detection(gen_text_list, url)
+            else:
+                temp_detection_result = CNNDetector.predict(gen_text_list)
+
+            for key, val in zip(detection_required_index, temp_detection_result):
+                detection_result[key] = val
+
+        return detection_result
+        
+    
+    # @classmethod
+    # def get_detection_old(cls, gen_text_list: list[str], validity_for_queries: list[int], is_sqli_for_queries: list[int], url: str = None):
+    #     if(url is not None):
+    #         if(len(gen_text_list) > cls.batch_size):
+    #             temp_result = []
+    #             for i in range(0, len(gen_text_list), cls.batch_size):
+    #                 temp_result += cls.get_waf_detection(gen_text_list[i:i+cls.batch_size], validity_for_queries[i:i+cls.batch_size], is_sqli_for_queries[i:i+cls.batch_size], url)
+
+    #             return temp_result
+
+    #         return cls.get_waf_detection(gen_text_list, validity_for_queries, is_sqli_for_queries, url)
+        
+    #     return CNNDetector.predict(gen_text_list)
+
+    @classmethod
+    def get_validity(cls, gen_text_list: list[str]):
+        return cls.sql_validator.check_SQL_validity(gen_text_list)[1]['result']
+    
+    @classmethod
+    def get_if_sqli(cls, gen_text_list: list[str]):
+        return cls.eval_model.nlp_detector(gen_text_list, verbose=False)
+    
+    @classmethod
+    def calc_metric(cls, gen_text: str, org_query: str, validity: int, is_sqli: int, detected: int):
+        similarity = jellyfish.jaro_similarity(gen_text, org_query)
+
+
+        #is valid, is sqli, evded detection, similarity, is valid sqli, evaded given that it is valid sqli, evaded overall
+        return [validity, int(is_sqli), int(1-detected), similarity,
+                1 if validity == 1 and is_sqli == 1 else 0, int(1-detected) if is_sqli == 1 and validity == 1 else np.nan,
+                1 if validity == 1 and is_sqli == 1 and detected == 0 else 0]
+
+    @classmethod
+    def calc_metric_single(cls, gen_text: str, org_query: str, url: str = None):
+
+        validity = cls.sql_validator.check_SQL_validity([gen_text])[0]
+        is_sqli = cls.eval_model.nlp_detector([gen_text], verbose=False)[0]
+        detected = cls.get_detection([gen_text], [validity], [is_sqli], url)[0]
+
+        similarity = jellyfish.jaro_similarity(gen_text, org_query)
+
+
+        #is valid, is sqli, evded detection, similarity, is valid sqli, evaded given that it is valid sqli, evaded overall
+        return [validity, int(is_sqli), int(1-detected), similarity,
+                1 if validity == 1 and is_sqli == 1 else 0, int(1-detected) if is_sqli == 1 and validity == 1 else np.nan,
+                1 if validity == 1 and is_sqli == 1 and detected == 0 else 0]
+
+    def compute(
+        self,
+        prompt_texts: List[str],
+        generated_texts: List[str],
+        reference_texts: List[List[str]],
+        meta_infos: List[Dict[str, Any]] = None,
+        model: PreTrainedModel = None,
+        split_name: str = None,
+    ):
+        #is valid, is sqli, evded detection, similarity, is valid sqli, evaded given that it is valid sqli, evaded overall
+        validity = []
+        is_sqli = []
+        evaded = []
+        similarity = []
+        is_valid_sqli = []
+        evaded_if_valid_sqli = []
+        evaded_overall = []
+
+        validity_for_queries = SQLiAvoidanceMetric.get_validity(generated_texts)
+        is_sqli_for_queries = SQLiAvoidanceMetric.get_if_sqli(generated_texts)
+        detected_for_queries = SQLiAvoidanceMetric.get_detection(generated_texts, validity_for_queries, is_sqli_for_queries, SQLiAvoidanceMetric.url)
+
+        for i in range(len(generated_texts)):
+            gen_text = generated_texts[i]
+            org_query = reference_texts[i][0]
+            reward_test = SQLiAvoidanceMetric.calc_metric(gen_text, org_query, validity_for_queries[i], is_sqli_for_queries[i], detected_for_queries[i])
+
+            validity.append(reward_test[0])
+            is_sqli.append(reward_test[1])
+            evaded.append(reward_test[2])
+            similarity.append(reward_test[3])
+            is_valid_sqli.append(reward_test[4])
+            evaded_if_valid_sqli.append(reward_test[5])
+            evaded_overall.append(reward_test[6])
+
+
+        metric_dict = {'validity': (validity, float(np.mean(validity))),
+                       'is_sqli': (is_sqli, float(np.mean(is_sqli))),
+                       'evasion': (evaded, float(np.mean(evaded))),
+                       'similarity': (similarity, float(np.mean(similarity))),
+                       'valid_sqli': (is_valid_sqli, float(np.mean(is_valid_sqli))),
+                       'evaded_if_valid_sqli': (evaded_if_valid_sqli, float(np.nanmean(evaded_if_valid_sqli))),
+                       'evaded_overall': (evaded_overall, float(np.mean(evaded_overall))),
+                       }
+        
+        print([key + ': ' + str(val[1]) for key, val in metric_dict.items()])
+        
+        return metric_dict
+    
+    def __init__(self, url: str = None):
+        SQLiAvoidanceMetric.url = url
 
 
 class LearnedRewardMetric(BaseMetric):

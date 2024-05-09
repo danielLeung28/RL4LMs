@@ -19,7 +19,11 @@ from rl4lms.data_pools.custom_text_generation_pools import (
     ToTTo,
     WMT14PreprocessedEnDe,
     WMT16NewsOnlyDatasetEnDe,
+    Xsum,
     DailyDialog,
+    SQLiDataPool,
+    SQLiDataPoolIterative,
+    SQLiDataPoolCrossVal
 )
 from rl4lms.data_pools.text_generation_pool import TextGenPool
 from rl4lms.envs.text_generation.alg_wrappers import wrap_onpolicy_alg
@@ -44,6 +48,7 @@ from rl4lms.envs.text_generation.metric import (
     TERMetric,
     chrFmetric,
     IntentAccuracyDailyDialog,
+    SQLiAvoidanceMetric,
 )
 from rl4lms.envs.text_generation.policy.base_policy import LMActorCriticPolicy
 from rl4lms.envs.text_generation.policy.causal_policy import (
@@ -74,6 +79,8 @@ from rl4lms.envs.text_generation.reward import (
     SpiderRewardFunction,
     chrF,
     IntentAccuracy,
+    SQLiDetectionAvodianceFunction,
+    SQLiDetectionAvodianceFunctionIterative
 )
 from rl4lms.envs.text_generation.preference_reward import CommonGenPrefRM
 from rl4lms.envs.text_generation.test_datapool import TestTextGenPool
@@ -99,6 +106,9 @@ class DataPoolRegistry:
         "iwslt2017en_de": IWSLT2017EnDe,
         "crd3": CRD3DialogueGeneration,
         "daily_dialog": DailyDialog,
+        'sqli_dataset': SQLiDataPool,
+        'sqli_dataset_iterative': SQLiDataPoolIterative,
+        'sqli_dataset_cross_val': SQLiDataPoolCrossVal
     }
 
     @classmethod
@@ -133,6 +143,8 @@ class RewardFunctionRegistry:
         "chrf": chrF,
         "intent_accuracy": IntentAccuracy,
         "common_gen_preference_model": CommonGenPrefRM,
+        'sqli_nlp': SQLiDetectionAvodianceFunction,
+        'sqli_nlp_iter': SQLiDetectionAvodianceFunctionIterative
     }
 
     @classmethod
@@ -169,6 +181,7 @@ class MetricRegistry:
         "ter": TERMetric,
         "chrf": chrFmetric,
         "intent_accuracy": IntentAccuracyDailyDialog,
+        'sqli_detection_evasion_acc': SQLiAvoidanceMetric
     }
 
     @classmethod
